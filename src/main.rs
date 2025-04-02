@@ -1,23 +1,28 @@
 use parking_lot::Mutex;
-use reqwest::Client;
+use serde_json::to_string_pretty;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::env::VarError;
 use std::process;
 use std::sync::Arc;
-use tracing::info;
+use tracing::warn;
 
 use chrono::Utc;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use tokio::{fs::File, io::AsyncReadExt};
+use slack_bot::file::*;
+use slack_bot::slack::*;
+use slack_bot::utils::cronjob::*;
+use slack_bot::utils::retry::*;
+use slack_bot::utils::time::*;
+use slack_bot::*;
 use tracing::{Level, error};
 
-static SLACK_TOKEN_ENV: &str = "SLACK_BOT_TOKEN";
+const SAVE_DATA_PERIOD_MS: u64 = 600_000;
+const SAVE_DATA_TIMEOUT_MS: u64 = 5_000;
 
-lazy_static::lazy_static! {
-    static ref CLIENT: Client = Client::new();
-}
+// TODO: use compactstr to store user id
+
 #[derive(Parser, Debug)]
 #[command(version, about = "config file should contains a list of username in json format", long_about = None)]
 struct Args {
@@ -29,71 +34,95 @@ struct Args {
     #[arg(long, value_name = "CONFIG")]
     config: String,
 
+    /// The config file name
+    #[arg(long, value_name = "SLACK_BOT_TOKEN")]
+    token: Option<String>,
+
     /// The testing count
     #[arg(short, long, default_value_t = 5)]
-    count: i64,
+    count: usize,
+
+    /// The testing period (day)
+    #[arg(short, long, default_value_t = 10)]
+    day: usize,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
-
-    if let Err(VarError::NotPresent) = std::env::var(SLACK_TOKEN_ENV) {
-        error!("env not set: {}", SLACK_TOKEN_ENV);
-        process::exit(0);
-    }
 
     let args = Args::parse();
 
-    let mut config = File::open(args.config.as_str()).await?;
-    let mut content = String::new();
-    config.read_to_string(&mut content).await?;
-    drop(config);
-    let user_list: Vec<String> = serde_json::from_str(&content)?;
+    let token = if let Some(token) = args.token {
+        token
+    } else {
+        match std::env::var(SLACK_TOKEN_ENV) {
+            Ok(token) => token,
+            Err(VarError::NotPresent) => {
+                error!(
+                    "cannot get slack bot token, please add `token` argument or add to env: {}",
+                    SLACK_TOKEN_ENV
+                );
+                process::exit(0);
+            }
+            Err(err) => {
+                error!("err: {}", err.to_string());
+                process::exit(0);
+            }
+        }
+    };
+    let client = Arc::new(SlackClient::new(&token));
 
-    let mappings: Arc<Mutex<HashMap<String, i64>>> = Arc::default();
-    let _guard = Guard::new(&args.output, mappings.clone());
+    // TODO: add parsing failed error msg
+    let raw_user = match dump_file(&args.config).await {
+        Ok(content) => content,
+        Err(err) => panic!("read config file error: {}", err),
+    };
+    let user_list: Vec<String> = match serde_json::from_str(&raw_user) {
+        Ok(content) => content,
+        Err(err) => panic!("config file format is invalid: {}", err),
+    };
 
-    {
-        let mappings = mappings.clone();
+    let data: Arc<Mutex<HashMap<String, i64>>> = Arc::default();
+    let cronjob = {
+        let data = data.clone();
         let filename = args.output.clone();
-        tokio::task::spawn(async move {
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
-                let mut mappings = mappings.lock();
-                let records: Vec<Record> = mappings
-                    .drain()
-                    .map(|(name, point)| Record {
-                        user_id: name,
-                        point,
-                    })
-                    .collect();
 
-                info!("{records:?}");
-                let serialized = serde_json::to_string_pretty(&records).unwrap();
-                if let Err(err) = std::fs::write(&filename, serialized) {
-                    println!("error: {err:?}");
+        let save_task_maker = move || {
+            let data = data.clone();
+            let filename = filename.clone();
+            async move {
+                let output = to_string_pretty(&Record::from_iter(data.lock().iter())).unwrap();
+                if let Err(err) = tokio::fs::write(&filename, &output).await {
+                    error!("save data failed: {err}");
                 }
             }
-        });
-    }
+        };
 
-    // let file = File::open("config.json")
+        AsyncCronJob::new(save_task_maker, SAVE_DATA_PERIOD_MS, SAVE_DATA_TIMEOUT_MS)
+    };
+
+    // start slack bot task for all user
     let mut handlers = Vec::new();
-    for user in user_list {
-        let data = mappings.clone();
-        let user = user.clone();
-        let count = args.count;
-        handlers.push(tokio::spawn(async move {
-            slack_test(user, data, count).await.ok();
-        }));
-    }
+    user_list.into_iter().for_each(|user| {
+        let data = data.clone();
+        let client = client.clone();
 
+        let handler = tokio::spawn(async move {
+            slack_test(user, data, args.count, args.day, client).await;
+        });
+
+        handlers.push(handler);
+    });
+
+    // wait until all task ending...
     for handle in handlers {
         handle.await.ok();
     }
 
-    Ok(())
+    if cronjob.shutdown().await.is_err() {
+        warn!("failed to save records gracefullty...");
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -102,36 +131,16 @@ struct Record {
     point: i64,
 }
 
-struct Guard {
-    filename: String,
-    data: Arc<Mutex<HashMap<String, i64>>>,
-}
-
-impl Guard {
-    fn new<T: Into<String>>(filename: T, data: Arc<Mutex<HashMap<String, i64>>>) -> Self {
-        Guard {
-            filename: filename.into(),
-            data,
-        }
-    }
-}
-
-impl Drop for Guard {
-    fn drop(&mut self) {
-        let mut mapping = self.data.lock();
-        let records: Vec<Record> = mapping
-            .drain()
-            .map(|(name, point)| Record {
-                user_id: name,
-                point,
-            })
-            .collect();
-
-        info!("{records:?}");
-        let serialized = serde_json::to_string_pretty(&records).unwrap();
-        if let Err(err) = std::fs::write(&self.filename, serialized) {
-            println!("error: {err:?}");
-        }
+impl Record {
+    pub fn from_iter<'a, I>(map: I) -> Vec<Self>
+    where
+        I: Iterator<Item = (&'a String, &'a i64)>,
+    {
+        map.map(|(id, point)| Record {
+            user_id: id.clone(),
+            point: *point,
+        })
+        .collect()
     }
 }
 
@@ -152,26 +161,27 @@ impl Event {
 async fn slack_test(
     user_id: String,
     data: Arc<Mutex<HashMap<String, i64>>>,
-    count: i64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    const SEC_PER_DAY: i64 = 86400;
-    let token = std::env::var("SLACK_BOT_TOKEN").unwrap();
+    count: usize,
+    days: usize,
+    client: Arc<SlackClient>,
+) {
     let curr_ts = Utc::now().timestamp(); // GMT
 
     // next day
     let start_ts = curr_ts / SEC_PER_DAY * SEC_PER_DAY + SEC_PER_DAY;
     let mut emit_ts: Vec<Event> = rand::random_iter::<u64>()
-        .take(count as usize)
+        .take(count)
         .flat_map(|rand_num| {
             // start + which day + which time
             // don't be too precisely at 17:00
-            let ts = start_ts + 86400 * (rand_num % 10) as i64 + rand::random_range(0..(8 * 3600));
+            let ts = start_ts
+                + SEC_PER_DAY * (rand_num % days as u64) as i64
+                + rand::random_range(0..(8 * 3600));
             let emit = Event::Emit(ts);
-            let check = Event::Check(ts + 86400);
+            let check = Event::Check(ts + SEC_PER_DAY);
             [emit, check]
         })
         .collect();
-
     emit_ts.sort_by(|a, b| a.get_ts().cmp(&b.get_ts()));
 
     let mut post_resp = VecDeque::new();
@@ -179,82 +189,44 @@ async fn slack_test(
         let curr_ts = Utc::now().timestamp();
         match event {
             Event::Emit(ts) => {
-                info!("{ts} & {curr_ts}");
+                // sleep to emit time
                 tokio::time::sleep(tokio::time::Duration::from_secs((ts - curr_ts) as u64)).await;
-
-                let ret: PostMessageResponse = CLIENT
-                    .post("https://slack.com/api/chat.postMessage")
-                    .header("Authorization", format!("Bearer {}", token))
-                    .json(&serde_json::json!({
-                        "channel": &user_id,
-                        "text": "hello, please give me some reaction in 24hr",
-                    }))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
-                post_resp.push_back(ret);
+                let result = retry_res(3, 5000, || client.send_msg(&user_id, "hello")).await;
+                match result {
+                    Ok(resp) => post_resp.push_back(Some(resp)),
+                    Err(err) => {
+                        error!("slack pinging failed: {:?}", err);
+                        post_resp.push_back(None);
+                    }
+                }
             }
             Event::Check(ts) => {
-                info!("{ts} & {curr_ts}");
                 tokio::time::sleep(tokio::time::Duration::from_secs((ts - curr_ts) as u64)).await;
+                if let Some(msg_id) = post_resp.pop_front().unwrap() {
+                    let result = retry_res(3, 5000, || client.get_reaction(&msg_id)).await;
+                    match result {
+                        Ok(resp) => {
+                            if !resp.is_empty() {
+                                client.send_msg(&user_id, "got msg!!!").await.ok();
 
-                let post_resp = post_resp.pop_front().unwrap();
-                info!("{post_resp:?}");
-                if post_resp.ok {
-                    let reaction_url = format!(
-                        "https://slack.com/api/reactions.get?channel={}&timestamp={}",
-                        post_resp.channel, post_resp.ts
-                    );
-
-                    let reaction_response: ReactionsResponse = CLIENT
-                        .get(&reaction_url)
-                        .header("Authorization", format!("Bearer {}", token))
-                        .send()
-                        .await?
-                        .json()
-                        .await?;
-
-                    if reaction_response.ok {
-                        if let Some(msg) = reaction_response.message {
-                            if !msg["reactions"].is_null() {
-                                info!("get reaction");
                                 let mut mapping = data.lock();
                                 mapping
                                     .entry(user_id.clone())
                                     .and_modify(|val| *val += 1)
                                     .or_insert(1);
+                            } else {
+                                client
+                                    .send_msg(&user_id, "cannot find your reaction QQ")
+                                    .await
+                                    .ok();
                             }
                         }
-                    } else {
-                        error!("Error fetching reactions: {}", user_id);
+                        Err(err) => {
+                            error!("slack get reaction failed: {:?}", err);
+                        }
                     }
-                } else {
-                    error!("failed to send msg to: {}", user_id);
                 }
             }
         }
     }
-
-    Ok(())
-}
-
-#[derive(Deserialize, Debug)]
-struct PostMessageResponse {
-    ok: bool,
-    channel: String,
-    ts: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct ReactionItem {
-    name: String,
-    count: u32,
-    users: Vec<String>,
-}
-
-#[derive(Deserialize, Debug)]
-struct ReactionsResponse {
-    ok: bool,
-    message: Option<serde_json::Value>,
 }
